@@ -5,20 +5,22 @@ Combines Shodan, Censys, NVD, Vulners, and Nmap for comprehensive analysis
 Usage: python3 recon.py <ip_address>
 """
 
+import os
 import sys
 import time
 import subprocess
 import requests
-from base64 import b64encode
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ─────────────────────────────────────────────
-#  API KEYS — replace with your actual keys
+#  API KEYS — loaded from .env file
 # ─────────────────────────────────────────────
-SHODAN_API_KEY    = "YOUR_SHODAN_API_KEY_HERE"      # https://shodan.io
-NVD_API_KEY       = "YOUR_NVD_API_KEY_HERE"         # https://nvd.nist.gov/developers/request-an-api-key
-CENSYS_API_ID     = "YOUR_CENSYS_API_ID_HERE"       # https://censys.io → Account → API
-CENSYS_API_SECRET = "YOUR_CENSYS_API_SECRET_HERE"
-VULNERS_API_KEY   = "YOUR_VULNERS_API_KEY_HERE"     # https://vulners.com → Account → API Keys
+SHODAN_API_KEY    = os.getenv("SHODAN_API_KEY", "YOUR_SHODAN_API_KEY_HERE").strip()
+NVD_API_KEY       = os.getenv("NVD_API_KEY", "YOUR_NVD_API_KEY_HERE")
+CENSYS_API_KEY    = os.getenv("CENSYS_API_KEY", "YOUR_CENSYS_API_KEY_HERE")
+VULNERS_API_KEY   = os.getenv("VULNERS_API_KEY", "YOUR_VULNERS_API_KEY_HERE")
 # ─────────────────────────────────────────────
 
 
@@ -48,19 +50,20 @@ def run_shodan(ip):
         return []
 
     try:
-        response = requests.get(
-            f"https://api.shodan.io/shodan/host/{ip}?key={SHODAN_API_KEY}",
-            timeout=15
-        )
+        response = requests.get("https://api.shodan.io/shodan/host/search",params={"query": "apache", "key": SHODAN_API_KEY})
 
         if response.status_code == 401:
             print("  [!] Invalid Shodan API key")
+            return []
+        if response.status_code == 403:
+            reason = response.json().get("error", response.text)
+            print(f"  [!] Shodan 403 Forbidden: {reason}")
             return []
         if response.status_code == 404:
             print("  [!] IP not found in Shodan database")
             return []
         if response.status_code != 200:
-            print(f"  [!] Shodan error: HTTP {response.status_code}")
+            print(f"  [!] Shodan error: HTTP {response.status_code} — {response.text[:200]}")
             return []
 
         data = response.json()
@@ -124,28 +127,27 @@ def run_shodan(ip):
 def run_censys(ip):
     section("CENSYS RESULTS")
 
-    if CENSYS_API_ID == "YOUR_CENSYS_API_ID_HERE":
-        print("  [!] Censys API credentials not set — skipping")
+    if CENSYS_API_KEY == "YOUR_CENSYS_API_KEY_HERE":
+        print("  [!] Censys API key not set — skipping")
         return []
 
     try:
-        credentials = b64encode(
-            f"{CENSYS_API_ID}:{CENSYS_API_SECRET}".encode()
-        ).decode()
-
         headers = {
-            "Authorization": f"Basic {credentials}",
+            "Authorization": f"Bearer {CENSYS_API_KEY}",
             "Content-Type": "application/json"
         }
 
         response = requests.get(
-            f"https://search.censys.io/api/v2/hosts/{ip}",
+            f"https://api.platform.censys.io/v3/global/asset/host/{ip}",
             headers=headers,
             timeout=15
         )
 
         if response.status_code == 401:
-            print("  [!] Invalid Censys API credentials")
+            print("  [!] Invalid Censys API key")
+            return []
+        if response.status_code == 403:
+            print("  [!] Censys access forbidden — check your plan permissions")
             return []
         if response.status_code == 404:
             print("  [!] IP not found in Censys database")
@@ -155,9 +157,15 @@ def run_censys(ip):
             return []
         if response.status_code != 200:
             print(f"  [!] Censys error: HTTP {response.status_code}")
+            print(response.text[:500])
             return []
 
-        data = response.json().get("result", {})
+        raw = response.json()
+        data = raw.get("result", {}).get("resource", {})
+        if not data:
+            print("  [!] Censys returned no resource data")
+            return []
+
         software_list = []
 
         print(f"  IP Address   : {data.get('ip', ip)}")
@@ -171,41 +179,63 @@ def run_censys(ip):
 
         location = data.get("location", {})
         if location:
-            print(f"  Location     : {location.get('city', 'N/A')}, {location.get('country', 'N/A')}")
+            city = location.get("city", "N/A")
+            country = location.get("country", location.get("country_code", "N/A"))
+            print(f"  Location     : {city}, {country}")
+
+            coords = location.get("coordinates", {})
+            if coords:
+                print(f"  Coordinates  : {coords.get('latitude', 'N/A')}, {coords.get('longitude', 'N/A')}")
 
         services = data.get("services", [])
         if services:
             print(f"\n  ── Services Detected ──")
             for svc in services:
-                port         = svc.get("port", "N/A")
-                transport    = svc.get("transport_protocol", "tcp").lower()
-                service_name = svc.get("service_name", "N/A")
-                extended     = svc.get("extended_service_name", "")
-                sw_list      = svc.get("software", [])
-                tls          = svc.get("tls", {})
+                port = svc.get("port", "N/A")
+                transport = svc.get("transport_protocol", "TCP").upper()
+                protocol = svc.get("protocol", "UNKNOWN")
+                banner = svc.get("banner", "").strip()
 
                 print(f"\n    Port    : {port}/{transport}")
-                print(f"    Service : {service_name}" +
-                      (f" ({extended})" if extended and extended != service_name else ""))
+                print(f"    Service : {protocol}")
 
-                for sw in sw_list:
+                if banner:
+                    print(f"    Banner  : {banner[:120]}")
+
+                # v3 response often has cert.parsed, not software[]
+                cert = svc.get("cert", {})
+                parsed = cert.get("parsed", {})
+                subject = parsed.get("subject_dn", "")
+                issuer = parsed.get("issuer_dn", "")
+
+                if subject:
+                    print(f"    TLS Subj: {subject[:80]}")
+                if issuer:
+                    print(f"    TLS Issu: {issuer[:80]}")
+
+                names = cert.get("names", [])
+                if names:
+                    print(f"    Cert SAN : {', '.join(names[:5])}" + (" ..." if len(names) > 5 else ""))
+
+                # keep software extraction if present on some hosts
+                for sw in svc.get("software", []):
                     p = sw.get("product", "")
                     v = sw.get("version", "")
                     if p:
                         print(f"    Software: {p} {v}".strip())
                         software_list.append({"product": p, "version": v})
 
-                if tls:
-                    cert = tls.get("certificates", {}).get("leaf_data", {})
-                    subject = cert.get("subject_dn", "")
-                    issuer  = cert.get("issuer_dn", "")
-                    if subject:
-                        print(f"    TLS Subj: {subject[:80]}")
-                    if issuer:
-                        print(f"    TLS Issu: {issuer[:80]}")
+                # fallback: collect protocol as software-like item if no explicit software exists
+                if not svc.get("software") and protocol and protocol != "UNKNOWN":
+                    software_list.append({"product": protocol, "version": ""})
 
-        last_updated = data.get("last_updated_at", "N/A")
-        print(f"\n  Last Updated : {last_updated[:10] if last_updated != 'N/A' else 'N/A'}")
+        # host-level last_updated_at is not present here; use latest scan_time instead
+        scan_times = [svc.get("scan_time") for svc in services if svc.get("scan_time")]
+        if scan_times:
+            latest_scan = max(scan_times)
+            print(f"\n  Last Updated : {latest_scan[:10]}")
+        else:
+            print("\n  Last Updated : N/A")
 
         return software_list
 
@@ -215,7 +245,6 @@ def run_censys(ip):
     except Exception as e:
         print(f"  [!] Censys error: {e}")
         return []
-
 
 # ─────────────────────────────────────────────
 #  NMAP
@@ -385,12 +414,15 @@ def lookup_vulners(software_list):
         try:
             response = requests.post(
                 "https://vulners.com/api/v3/search/lucene/",
+                headers={
+                    "X-Api-Key": VULNERS_API_KEY,
+                    "Content-Type": "application/json",
+                },
                 json={
                     "query":  query,
                     "fields": ["id", "cvss", "title", "description",
                                "published", "type", "href"],
-                    "size":   5,
-                    "apiKey": VULNERS_API_KEY
+                    "size":   5
                 },
                 timeout=15
             )
